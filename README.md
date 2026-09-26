@@ -111,11 +111,11 @@ protection-disabled baseline are not covered here.
 
 | Path | Work per operation | Time | B/op | Allocs/op | Throughput |
 |---|---:|---:|---:|---:|---:|
-| Journal failure detector | 1 failed-login event | 0.905 µs | 122 | 2 | — |
-| CrowdSec JSON decode | 100 decisions | 56.86 µs | 26,085 | 119 | 216.4 MB/s |
-| nft ban-set compile | 100 bans | 78.20 µs | 204,369 | 2,470 | — |
-| nft ban-set compile | 1,000 bans | 0.347 ms | 1,138,708 | 6,980 | — |
-| nft ban-set compile | 10,000 bans | 8.039 ms | 17,119,158 | 52,005 | — |
+| Journal failure detector | 1 failed-login event | 0.879 µs | 122 | 2 | — |
+| CrowdSec JSON decode | 100 decisions | 56.63 µs | 26,085 | 119 | 210.6 MB/s |
+| nft ban-set compile | 100 bans | 29.28 µs | 97,155 | 905 | — |
+| nft ban-set compile | 1,000 bans | 128.12 µs | 510,312 | 3,638 | — |
+| nft ban-set compile | 10,000 bans | 1.255 ms | 5,886,148 | 12,506 | — |
 
 ### Ruleset compilation cost
 
@@ -126,10 +126,30 @@ rules on Linux arm64 (Go 1.22.2, `-benchmem -benchtime=1s`):
 |---|---:|---:|
 | Before `d6ac943` | 23,944 | 1,049,586 |
 | After `d6ac943` | 21,944 | 1,009,581 |
+| Current optimized path | 90 | 321,602 |
 
-−2,000 allocations (−8.4%) and about 40 KB (−3.8%). Wall-clock moved less than
-run-to-run spread, so treat this as an allocation win, not a speedup. CI
-reproduces the post-change figures on x86_64 (21,945 allocs/op, 1,009,375 B/op).
+The latest compiler path removes 21,854 allocations (−99.6%) and about 688 KB
+(−68.1%) from the post-`d6ac943` result. On the local arm64 run it compiled
+1,000 ordinary rules in about 0.28 ms and 1,000 limit rules in about 0.83 ms;
+this is configuration compilation, not packet filtering. CI should be used for
+cross-machine comparisons.
+
+`BenchmarkRulesetRender` covers the `bfw diff`/dry-run text path with 1,000
+multi-port rules. After the set index but before builder sizing, it measured
+2.10 ms, 793,153 B/op, and 16,096 allocations/op on the local arm64 run.
+The current streaming renderer measures about 0.64 ms, 384,858 B/op, and
+78 allocations/op. A 1,000-rule limit-render run measures about 2.41 ms,
+2,000,366 B/op, and 97 allocations/op. The renderer keeps the compiled
+object order and output text deterministic.
+
+`BenchmarkRuleMatch1000` covers the duplicate/update scan used by CLI rule
+mutations. Comparing 1,000 candidates now takes about 58 µs with zero heap
+bytes and zero allocations per operation. `BenchmarkTupleKey1000`, used by
+import/export indexing, takes about 0.24 ms, 112,000 B/op, and 1,000
+allocations/op for the same 1,000-rule workload after the port formatter
+moved to a stack buffer. `BenchmarkAppTuple1000`, used by application-profile
+grouping in status and rule mutation commands, takes about 0.082 ms, 64,000
+B/op, and 1,000 allocations/op.
 
 ## Firewall comparison and resource usage
 
@@ -179,6 +199,37 @@ independent measurement.
 | bfw | 76.57 | 111.71 | 29.69 | 43.92 |
 | UFW | 72.32 | 111.05 | 34.22 | 41.59 |
 
+### Attack-lab comparison
+
+A separate hosted job drives real attacks at the defended container: nmap
+recon, hping3 SYN floods (denied and allowed ports), a TCP connect flood,
+12-round SSH brute-force attempts, and dynamic ban/unban pushes through a
+CrowdSec-compatible LAPI — all while an independent client keeps measuring
+legitimate keep-alive traffic. Engines: no firewall, bfw, and UFW with 10
+allow rules, 6 s per attack. From CI run
+[36265933201](https://github.com/tmih06/better-firewall/actions/runs/36265933201):
+Linux 6.17 x86_64, hping3, Nmap 7.93, dropbear as the SSH target.
+
+![Attack-lab board: nmap recon time, legit requests during each attack, and dynamic ban outcomes for no firewall, bfw, and UFW](docs/attack-lab.svg)
+
+| Measure | No firewall | bfw | UFW |
+|---|---:|---:|---:|
+| nmap 1–2000 | 2,000 closed in 0.13 s | 1,999 filtered in 7.13 s | 1,999 filtered in 7.22 s |
+| Ports visible in 8070–8110 | 8080, 8081 | 8080 only | 8080 only |
+| Legit reqs, SYN flood → denied | 163,056 | 145,646 | 154,074 |
+| Legit reqs, SYN flood → allowed | 148,100 | 145,602 | 145,164 |
+| Legit reqs, connect flood | 126,818 | 131,771 | 122,735 |
+| Failed legit requests | 0 | 0 | 0 |
+| SSH brute-force (12 tries) | attacker unbanned | **banned in 0.1 s; ssh blocked** | attacker unbanned |
+| LAPI ban → attacker | — | **blocked in 0.9 s; unban in 0.1 s** | — |
+
+Under either firewall, recon turns into seconds of filtered ports instead of
+instant answers, and legit traffic survives every flood without failures
+(p95 ≤ 1.31 ms). The dynamic rows are what ufw cannot do at all: bfw protect
+banned the brute-forcer's IP 0.1 s after the fifth failed SSH attempt and
+applied a CrowdSec-style LAPI decision 0.9 s after it was pushed — while the
+independent legit stream was never affected.
+
 ## Migrate an existing firewall
 
 Preview first, then take over only when the output is correct:
@@ -194,17 +245,21 @@ Migration supports supported rules from UFW, firewalld, iptables-persistent, and
 
 ```sh
 make test               # unprivileged unit tests
-make check              # formatting, vet, static analysis, shell checks, chart data, vulnerability scan
+make check              # formatting, vet, static analysis, shell checks, vulnerability scan
 make package            # staged install and systemd-unit validation
-make benchmark-protect  # safe local protection microbenchmarks
+make benchmark-protect  # safe local protection and ruleset microbenchmarks
 make charts             # regenerate the README benchmark charts
 ```
 
-The README charts are generated by `scripts/charts/charts.py` from snapshots in
-`scripts/charts/testdata/`, and `make check` fails if a committed chart drifts
-from its data. To publish a new run, replace the snapshot and run `make charts`.
+The README charts are generated by `scripts/charts/charts.py` from the snapshot
+in `scripts/charts/testdata/`. To publish a new run, download the `performance`,
+`protection-benchmarks`, and `better-firewall-attack` CI artifacts into one
+directory and run `python3 scripts/charts/charts.py <dir>` (expects
+`summary.json`, `protection-benchmarks.txt`, and `attack-summary.json`), then
+commit the updated SVGs. `make charts` regenerates them from the committed
+snapshot.
 
-CI runs build, race-test, package, security, and protection-benchmark jobs. Kernel integration tests and the UFW traffic benchmark run only on isolated GitHub-hosted runners. **Do not run those privileged workloads on a workstation or production host.** See [CI](.github/workflows/ci.yml).
+CI runs build, race-test, package, security, and protection-benchmark jobs. Kernel integration tests, the UFW traffic benchmark, and the attack-lab comparison (nmap recon plus SYN/connect floods against bfw- and ufw-defended containers) run only on isolated GitHub-hosted runners. **Do not run those privileged workloads on a workstation or production host.** See [CI](.github/workflows/ci.yml).
 
 ## License
 
